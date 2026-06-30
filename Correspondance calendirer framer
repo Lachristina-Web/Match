@@ -16,7 +16,7 @@ const CONFIG = {
   // Lien .ics public de Scorenco (l'URL de ton calendrier d'équipe)
   ICS_URL: "https://app.scorenco.com/calendar/team/1493070/calendar.ics",
 
-  // Clé API Framer — se trouve dans Framer > Settings > API
+  // Cle API Framer — se trouve dans Framer > Settings > API
   FRAMER_API_KEY: "fr_6vz78na9k78fer7629s62mdes8", 
 
   // ID de ton PROJET (on triche pour que le script trouve l'ID de la collection tout seul)
