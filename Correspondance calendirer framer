@@ -1,0 +1,296 @@
+/**
+ * sync-ics-framer.js
+ * Synchronise le calendrier ICS de Scorenco (FFVB) vers la collection CMS Framer "Matchs"
+ *
+ * Utilisation : node sync-ics-framer.js
+ * Planification : toutes les 6h via Make.com, GitHub Actions, ou cron
+ */
+
+const https = require("https");
+const http = require("http");
+
+// ─────────────────────────────────────────────
+// CONFIGURATION — à remplir une seule fois
+// ─────────────────────────────────────────────
+const CONFIG = {
+  // Lien .ics public de Scorenco (l'URL de ton calendrier d'équipe)
+  ICS_URL: "https://app.scorenco.com/calendar/team/1493070/calendar.ics",
+
+  // Clé API Framer — se trouve dans Framer > Settings > API
+  FRAMER_API_KEY: "fr_6vz78na9k78fer7629s62mdes8", 
+
+  // ID de ton PROJET (on triche pour que le script trouve l'ID de la collection tout seul)
+  FRAMER_COLLECTION_ID: "l7IEnULAHsErc2vDklxp-s0b6o",
+
+  // Décalage horaire Paris (UTC+1 hiver, UTC+2 été) — géré automatiquement
+  TIMEZONE: "Europe/Paris",
+};
+
+// ─────────────────────────────────────────────
+// UTILITAIRES
+// ─────────────────────────────────────────────
+
+/** Télécharge le contenu d'une URL (http ou https) */
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
+    lib
+      .get(url, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
+}
+
+/** Appel HTTP vers l'API Framer CMS */
+function framerRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = body ? JSON.stringify(body) : "";
+    const options = {
+      hostname: "api.framer.com",
+      path: `/cms/v1/${path}`,
+      method,
+      headers: {
+        Authorization: `Bearer ${CONFIG.fr_6vz78na9k78fer7629s62mdes8}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(bodyStr),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve({ status: res.statusCode, body: JSON.parse(data) });
+        } catch {
+          resolve({ status: res.statusCode, body: data });
+        }
+      });
+    });
+    req.on("error", reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ─────────────────────────────────────────────
+// PARSING ICS
+// ─────────────────────────────────────────────
+
+/**
+ * Parse un fichier ICS brut et retourne un tableau d'événements
+ * Gère les propriétés multi-lignes (folding RFC 5545)
+ */
+function parseICS(raw) {
+  // Déplie les lignes continues (une ligne qui commence par espace = continuation)
+  const unfolded = raw.replace(/\r\n[ \t]/g, "").replace(/\r\n/g, "\n");
+
+  const events = [];
+  const blocks = unfolded.split("BEGIN:VEVENT");
+
+  for (let i = 1; i < blocks.length; i++) {
+    const block = blocks[i];
+    const get = (key) => {
+      // Supporte les variantes avec paramètres : DTSTART;TZID=...
+      const match = block.match(new RegExp(`^${key}[;:][^\n]*`, "m"));
+      if (!match) return null;
+      return match[0].replace(/^[^:]+:/, "").trim();
+    };
+
+    const uid = get("UID");
+    const summary = get("SUMMARY") || "";
+    const location = get("LOCATION") || "";
+    const dtstart = get("DTSTART");
+
+    if (!uid || !dtstart) continue;
+
+    // Parse la date ICS (YYYYMMDDTHHMMSS) vers un objet Date UTC
+    const dateStr = dtstart.replace(
+      /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/,
+      "$1-$2-$3T$4:$5:$6"
+    );
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) continue;
+
+    // Extrait les équipes depuis le SUMMARY
+    // Format Scorenco : "Match: Equipe A - Equipe B | Compétition"
+    const summaryClean = summary.replace(/\s+/g, " ").trim();
+    const matchTeams = summaryClean.match(/Match:\s*(.+?)\s*\|/);
+    const teams = matchTeams ? matchTeams[1].trim() : summaryClean;
+
+    // Détermine si LA CHRISTINA joue à domicile ou à l'extérieur
+    const isHome = teams.toUpperCase().startsWith("LA CHRISTINA");
+    const domicile = isHome ? "Domicile" : "Extérieur";
+
+    // Génère un slug lisible : "2025-11-23-la-christina-sco"
+    const slug = `${date.toISOString().slice(0, 10)}-${teams
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .slice(0, 40)}`;
+
+    events.push({
+      uid,
+      title: `${domicile} · ${teams}`,
+      slug,
+      date: date.toISOString(), // Format ISO 8601 requis par Framer
+      location: location.replace(/\s+/g, " ").trim(),
+      isHome,
+      raw: teams,
+    });
+  }
+
+  // Trie par date croissante
+  return events.sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+// ─────────────────────────────────────────────
+// SYNCHRONISATION FRAMER
+// ─────────────────────────────────────────────
+
+/**
+ * Récupère tous les items existants dans la collection Framer
+ * Retourne un Map UID → item Framer
+ */
+async function getExistingItems() {
+  const res = await framerRequest(
+    "GET",
+    `collections/${CONFIG.l7IEnULAHsErc2vDklxp-s0b6o}/items`
+  );
+
+  if (res.status !== 200) {
+    console.error("❌ Erreur lecture collection Framer :", res.body);
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  const map = new Map();
+  const items = res.body.items || res.body || [];
+  for (const item of items) {
+    // L'UID Scorenco est stocké dans le champ slug (ou un champ custom)
+    const uid = item.fieldData?.slug?.replace(/^uid-/, "") || null;
+    if (uid) map.set(uid, item);
+  }
+  return map;
+}
+
+/**
+ * Crée un nouvel item dans la collection Framer
+ */
+async function createItem(event) {
+  const res = await framerRequest(
+    "POST",
+    `collections/${CONFIG.l7IEnULAHsErc2vDklxp-s0b6o}/items`,
+    {
+      fieldData: {
+        // "name" correspond au champ "Title (Affiche)" dans Framer
+        name: event.title,
+        slug: `uid-${event.uid}`, // Utilisé comme clé d'idempotence
+        // Champ Date de match : format ISO 8601
+        "date-de-match": event.date,
+        // Champ Lieu (Salle)
+        lieu: event.location || "Salle à confirmer",
+      },
+    }
+  );
+
+  if (res.status === 200 || res.status === 201) {
+    console.log(`  ✅ Créé : ${event.title} (${event.date.slice(0, 10)})`);
+  } else {
+    console.error(`  ❌ Erreur création ${event.uid} :`, res.body);
+  }
+  return res;
+}
+
+/**
+ * Met à jour un item existant dans Framer si les données ont changé
+ */
+async function updateItem(itemId, event, existing) {
+  const currentDate = existing.fieldData?.["date-de-match"] || "";
+  const currentLocation = existing.fieldData?.lieu || "";
+
+  // Ne met à jour que si quelque chose a changé (évite les appels inutiles)
+  if (currentDate === event.date && currentLocation === event.location) {
+    console.log(
+      `  ⏭️  Inchangé : ${event.title} (${event.date.slice(0, 10)})`
+    );
+    return;
+  }
+
+  const res = await framerRequest(
+    "PATCH",
+    `collections/${CONFIG.l7IEnULAHsErc2vDklxp-s0b6o}/items/${itemId}`,
+    {
+      fieldData: {
+        name: event.title,
+        "date-de-match": event.date,
+        lieu: event.location || "Salle à confirmer",
+      },
+    }
+  );
+
+  if (res.status === 200) {
+    console.log(
+      `  🔄 Mis à jour : ${event.title} — nouvelle date : ${event.date.slice(0, 10)}, lieu : ${event.location}`
+    );
+  } else {
+    console.error(`  ❌ Erreur mise à jour ${event.uid} :`, res.body);
+  }
+}
+
+// ─────────────────────────────────────────────
+// POINT D'ENTRÉE PRINCIPAL
+// ─────────────────────────────────────────────
+
+async function main() {
+  console.log("🏐 Synchronisation calendrier LA CHRISTINA VB → Framer CMS");
+  console.log(`📅 ${new Date().toLocaleString("fr-FR")}\n`);
+
+  // 1. Télécharge et parse le calendrier ICS
+  console.log("📥 Téléchargement du calendrier ICS...");
+  const icsRaw = await fetchUrl(CONFIG.ICS_URL);
+  const events = parseICS(icsRaw);
+  console.log(`   ${events.length} matchs trouvés dans le calendrier\n`);
+
+  // 2. Récupère les items existants dans Framer
+  console.log("🔍 Lecture de la collection Framer...");
+  const existingItems = await getExistingItems();
+  console.log(
+    `   ${existingItems.size} items déjà présents dans Framer CMS\n`
+  );
+
+  // 3. Synchronise chaque événement
+  console.log("🔄 Synchronisation en cours...");
+  for (const event of events) {
+    if (existingItems.has(event.uid)) {
+      // Item existant → mise à jour si nécessaire
+      const existing = existingItems.get(event.uid);
+      await updateItem(existing.id, event, existing);
+    } else {
+      // Nouvel item → création
+      await createItem(event);
+    }
+  }
+
+  console.log("\n✅ Synchronisation terminée !");
+
+  // 4. Résumé : prochain match à venir
+  const now = new Date();
+  const nextMatch = events.find((e) => new Date(e.date) > now);
+  if (nextMatch) {
+    const d = new Date(nextMatch.date);
+    console.log(`\n🎯 Prochain match :`);
+    console.log(
+      `   ${nextMatch.title} · le ${d.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })} à ${d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`
+    );
+    if (nextMatch.location)
+      console.log(`   📍 ${nextMatch.location.split(" ").slice(0, 5).join(" ")}...`);
+  }
+}
+
+main().catch((err) => {
+  console.error("\n💥 Erreur critique :", err.message);
+  process.exit(1);
+});
+
+
